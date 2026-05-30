@@ -121,9 +121,162 @@ These are things I did not explicitly require but the AI chose well:
  
 ## Task 2 — Unit tests for `domain.TimeRange.Overlaps`
  
-_(pending — fill in after task is complete)_
+**Branch:** `test/timerange-unit`
+**Goal:** A table-driven unit-test suite that documents and verifies the half-open
+`[)` overlap semantics — particularly that back-to-back adjacent ranges do NOT overlap. These tests serve as executable documentation of the core invariant the integration tests rely on, and run in milliseconds without a database.
+ 
+### Direction strategy
+ 
+The prompt enumerated 11 specific cases by name (identical, complete-overlap both directions, partial-overlap both directions, disjoint both directions, adjacent both directions, one-minute-overlap both directions). I called out the adjacent cases explicitly in the prompt: they are the half-open property under test, and the most likely place for the AI to err.
+ 
+Hard rules required:
+ 
+- Table-driven structure with `t.Run` sub-tests so each case is independently reportable in failure output
+- Standard library only — no testify or third-party assertion helpers
+- **Refuse to modify `domain.go`** if a bug is suspected. The unit tests
+  document intended behavior; production code is not the variable under test
+- Adjacent cases must carry a comment that explicitly mentions "half-open"
+- Realistic timestamps built with `time.Date(...)` rather than `time.Parse`
+  for clarity and determinism
+### What the AI delivered
+ 
+The first pass was clean and required no corrections:
+ 
+- Both `adjacent_*` cases expect `false` with explicit comments referencing
+  the half-open `[)` convention — the single place where a wrong answer would   have been concerning
+- A small `at(hour, min int)` closure anchored every case to the same date, which is cleaner than 11 repeated `time.Date(2026, 6, 1, ...)` calls
+- Every overlap pattern is exercised in both directions, so the symmetry of
+  `Overlaps` is verified by the data itself rather than asserted separately
+- A "one-minute overlap" pair beyond the minimum spec — proves the operator   works on a single shared minute, not just on coarse hour-aligned ranges
+- White-box `package domain` testing, no exports widened for testing alone
+- A header comment on the test function restates the overlap formula
+  `a.Start < b.End && b.Start < a.End` and its half-open consequence,
+  doubling as in-source documentation for future readers
+### Verification I ran
+ 
+```
+go test ./internal/domain/... -v -count=1
+  === RUN   TestTimeRange_Overlaps
+  --- PASS: TestTimeRange_Overlaps/identical_ranges
+  --- PASS: TestTimeRange_Overlaps/complete_overlap_b_inside_a
+  --- PASS: TestTimeRange_Overlaps/complete_overlap_a_inside_b
+  --- PASS: TestTimeRange_Overlaps/partial_overlap_b_starts_inside_a
+  --- PASS: TestTimeRange_Overlaps/partial_overlap_a_starts_inside_b
+  --- PASS: TestTimeRange_Overlaps/disjoint_a_before_b_with_gap
+  --- PASS: TestTimeRange_Overlaps/disjoint_b_before_a_with_gap
+  --- PASS: TestTimeRange_Overlaps/adjacent_a_ends_when_b_starts
+  --- PASS: TestTimeRange_Overlaps/adjacent_b_ends_when_a_starts
+  --- PASS: TestTimeRange_Overlaps/one_minute_overlap_a_ends_during_b
+  --- PASS: TestTimeRange_Overlaps/one_minute_overlap_b_ends_during_a
+  PASS
+go test ./... -count=1                                  # everything green
+go test ./test/... -tags=integration -count=1 -v        # see Bugfix below
+```
+ 
+### Reflection — comparing this task to Task 1
+ 
+This is the inverse of Task 1's narrative. In Task 1 the AI made consistency
+mistakes I had to catch in code review (locally-declared response struct,
+missing structured logging); here the AI got it right on the first pass,
+including the case that mattered most.
+ 
+The difference, I think, was prompt precision. Task 1 gave the AI an open
+design space — the spec described *what* to build but left the *how* to
+inference, and it cut corners on conventions that already existed in the
+codebase. Task 2 enumerated exactly what each test case must contain, what
+helpers were allowed, and what semantic each adjacent case must demonstrate. That left no room to drift.
+ 
+Documenting both outcomes honestly is the point: AI quality scales with the
+specificity of direction, and a single workflow has room for both modes —
+loose prompts for exploration, tight prompts when the shape of the answer
+is already known.
  
 ---
+ 
+## Bugfix — Retry handler missed `deadlock_detected`
+ 
+**Branch:** `fix/retry-on-deadlock`
+ 
+### How it was found
+ 
+After completing Task 2, I re-ran the full integration suite as a sanity
+check — even though Task 2 only touched `internal/domain/` and should have
+been independent. The concurrency test failed in a way I had not seen before:
+ 
+```
+booking_concurrency_test.go:66: unexpected error: ERROR: deadlock detected (SQLSTATE 40P01)
+```
+ 
+The exclusion-constraint correctness guarantee was intact — no double-booking occurred — but the retry loop in `BookAppointment` only caught `23P01`
+(`exclusion_violation`). Postgres had detected a deadlock and aborted the
+losing transaction with `40P01`, which the loop did not recognize, so the
+raw error surfaced to the service and the test reported it as `unexpected`.
+ 
+Critically, this was non-deterministic: the same concurrency test had passed
+cleanly multiple times before. The failure depended on which conflict detector
+fired first under the specific transaction interleaving — and a flaky integration
+test that hides a real error-handling gap is a worse smell than a deterministic
+failure would have been.
+ 
+### Root cause
+ 
+Two retry-safe Postgres error codes were in play, but only one was handled:
+ 
+- `23P01` — `exclusion_violation`: my exclusion constraint refused the insert because another confirmed appointment already occupied the bay or technician for the requested window. Handled.
+- `40P01` — `deadlock_detected`: Postgres detected a cycle between two
+  transactions holding row-level locks on each other's needed rows, picked
+  a victim, and rolled it back. **Not handled.** Both are transient and both leave the database in a consistent state — they are exactly the kind of errors a bounded retry loop should swallow and try again on different candidate resources.
+ 
+### Fix
+ 
+Extended the retry switch to cover both transient SQLSTATEs, plus
+`40001` (`serialization_failure`) preemptively in case the isolation level
+is ever raised to `SERIALIZABLE`:
+ 
+```go
+var pgErr *pgconn.PgError
+if errors.As(err, &pgErr) {
+    switch pgErr.Code {
+    case "23P01": // exclusion_violation — another tx won the slot
+        continue
+    case "40P01": // deadlock_detected — Postgres killed us, safe to retry
+        continue
+    case "40001": // serialization_failure — retryable under SERIALIZABLE
+        continue
+    }
+}
+return domain.Appointment{}, err
+```
+ 
+### Verification
+ 
+Ran the concurrency test five times in a row after the fix:
+ 
+```
+=== Run 1 === OK: 1 success, 19 conflicts out of 20
+=== Run 2 === OK: 1 success, 19 conflicts out of 20
+=== Run 3 === OK: 1 success, 19 conflicts out of 20
+=== Run 4 === OK: 1 success, 19 conflicts out of 20
+=== Run 5 === OK: 1 success, 19 conflicts out of 20
+```
+ 
+Stable. Full integration suite (4 tests) and the unit suite both pass.
+ 
+### What I took away
+ 
+This was the kind of issue a single test run won't surface. The value of
+re-running the integration suite after *every* change — including ones
+(like Task 2's pure unit tests) that should be unrelated to the failing
+area — is exactly catching transient bugs masquerading as flakes. This
+incident made the case for treating them as the primary signal that the
+system is still healthy, not just that the new code compiles.
+ 
+It also reframed the original retry logic for me. The `23P01`-only handler
+felt complete because it matched the design document's vocabulary
+("exclusion constraint as source of truth"). But Postgres has its own
+opinion about which error it raises first under contention, and a
+correctness mechanism is only as good as the error-handling surface
+around it.
  
 ## Task 3 — OpenAPI specification
  
