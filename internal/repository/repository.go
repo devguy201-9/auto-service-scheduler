@@ -97,8 +97,15 @@ VALUES
 
 		// Lost the race: The selected bay or technician was taken between SELECT and INSERT.
 		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) && pgErr.Code == "23P01" { // exclusion_violation
-			continue
+		if errors.As(err, &pgErr) {
+			switch pgErr.Code {
+			case "23P01": // exclusion_violation — another transaction won the slot
+				continue
+			case "40P01": // deadlock_detected — Postgres killed us, safe to retry
+				continue
+			case "40001": // serialization_failure — also retryable for completeness
+				continue
+			}
 		}
 		return domain.Appointment{}, err
 	}
