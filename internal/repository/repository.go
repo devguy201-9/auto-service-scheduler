@@ -56,11 +56,11 @@ type BookingRequest struct {
 // If a race condition occurs, it re-selects candidates and retries (bounded retry).
 func (r *Repository) BookAppointment(ctx context.Context, req BookingRequest) (domain.Appointment, error) {
 	for attempt := 0; attempt < maxBookingRetries; attempt++ {
-		bayID, err := r.findFreeBay(ctx, req.DealershipID, req.Window)
+		bayID, err := r.FindFreeBay(ctx, req.DealershipID, req.Window)
 		if err != nil {
 			return domain.Appointment{}, err
 		}
-		techID, err := r.findFreeTechnician(ctx, req.DealershipID, req.ServiceType.RequiredSkillID, req.Window)
+		techID, err := r.FindFreeTechnician(ctx, req.DealershipID, req.ServiceType.RequiredSkillID, req.Window)
 		if err != nil {
 			return domain.Appointment{}, err
 		}
@@ -105,7 +105,7 @@ VALUES
 	return domain.Appointment{}, ErrNoAvailability
 }
 
-func (r *Repository) findFreeBay(ctx context.Context, dealershipID uuid.UUID, w domain.TimeRange) (uuid.UUID, error) {
+func (r *Repository) FindFreeBay(ctx context.Context, dealershipID uuid.UUID, w domain.TimeRange) (uuid.UUID, error) {
 	const q = `
 SELECT sb.id
 FROM service_bay sb
@@ -125,7 +125,7 @@ LIMIT 1`
 	return id, err
 }
 
-func (r *Repository) findFreeTechnician(ctx context.Context, dealershipID, skillID uuid.UUID, w domain.TimeRange) (uuid.UUID, error) {
+func (r *Repository) FindFreeTechnician(ctx context.Context, dealershipID, skillID uuid.UUID, w domain.TimeRange) (uuid.UUID, error) {
 	const q = `
 SELECT t.id
 FROM technician t

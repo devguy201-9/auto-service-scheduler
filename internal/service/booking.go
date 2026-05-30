@@ -12,6 +12,57 @@ import (
 	"github.com/devguy201-9/auto-service-scheduler/internal/repository"
 )
 
+type CheckAvailabilityRequest struct {
+	DealershipID  uuid.UUID
+	ServiceTypeID uuid.UUID
+	DesiredStart  time.Time
+}
+
+type AvailabilityResult struct {
+	Available     bool
+	BayFree       bool
+	TechFree      bool
+	Window        domain.TimeRange
+	DealershipID  uuid.UUID
+	ServiceTypeID uuid.UUID
+}
+
+func (s *BookingService) CheckAvailability(ctx context.Context, req CheckAvailabilityRequest) (AvailabilityResult, error) {
+	st, err := s.repo.GetServiceType(ctx, req.ServiceTypeID)
+	if err != nil {
+		return AvailabilityResult{}, err
+	}
+	window := domain.TimeRange{
+		Start: req.DesiredStart,
+		End:   req.DesiredStart.Add(st.Duration),
+	}
+	bayID, err := s.repo.FindFreeBay(ctx, req.DealershipID, window)
+	if err != nil {
+		return AvailabilityResult{}, err
+	}
+	techID, err := s.repo.FindFreeTechnician(ctx, req.DealershipID, st.RequiredSkillID, window)
+	if err != nil {
+		return AvailabilityResult{}, err
+	}
+	bayFree := bayID != uuid.Nil
+	techFree := techID != uuid.Nil
+
+	s.log.Info("availability checked",
+		"dealership", req.DealershipID,
+		"service_type", req.ServiceTypeID,
+		"available", bayFree && techFree,
+		"bay_free", bayFree, "tech_free", techFree)
+
+	return AvailabilityResult{
+		Available:     bayFree && techFree,
+		BayFree:       bayFree,
+		TechFree:      techFree,
+		Window:        window,
+		DealershipID:  req.DealershipID,
+		ServiceTypeID: req.ServiceTypeID,
+	}, nil
+}
+
 type BookingService struct {
 	repo *repository.Repository
 	log  *slog.Logger
