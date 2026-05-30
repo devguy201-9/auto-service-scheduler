@@ -36,6 +36,7 @@ func (h *Handler) Routes() http.Handler {
 	r.Route("/api/v1", func(r chi.Router) {
 		r.Post("/appointments", h.createAppointment)
 		r.Get("/appointments/{id}", h.getAppointment)
+		r.Get("/dealerships/{dealership_id}/availability", h.getAvailability)
 	})
 	return r
 }
@@ -104,4 +105,81 @@ func (h *Handler) getAppointment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, appointmentView(appt))
+}
+
+func (h *Handler) getAvailability(w http.ResponseWriter, r *http.Request) {
+	dealershipID, err := uuid.Parse(chi.URLParam(r, "dealership_id"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid dealership_id")
+		return
+	}
+
+	q := r.URL.Query()
+	serviceTypeIDStr := q.Get("service_type_id")
+	startStr := q.Get("start")
+
+	if serviceTypeIDStr == "" {
+		writeError(w, http.StatusBadRequest, "missing service_type_id")
+		return
+	}
+	if startStr == "" {
+		writeError(w, http.StatusBadRequest, "missing start")
+		return
+	}
+
+	serviceTypeID, err := uuid.Parse(serviceTypeIDStr)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid service_type_id")
+		return
+	}
+	start, err := time.Parse(time.RFC3339, startStr)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid start timestamp")
+		return
+	}
+
+	result, err := h.booking.CheckAvailability(r.Context(), service.CheckAvailabilityRequest{
+		DealershipID:  dealershipID,
+		ServiceTypeID: serviceTypeID,
+		DesiredStart:  start,
+	})
+	switch {
+	case errors.Is(err, repository.ErrServiceTypeNotFound):
+		writeError(w, http.StatusBadRequest, "unknown service type")
+		return
+	case err != nil:
+		h.log.Error("availability check failed", "err", err)
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+
+	win := windowView(result.Window)
+
+	if result.Available {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"available":       true,
+			"window":          win,
+			"dealership_id":   dealershipID,
+			"service_type_id": serviceTypeID,
+		})
+		return
+	}
+
+	var reason string
+	switch {
+	case !result.BayFree && !result.TechFree:
+		reason = "no_bay_and_no_technician"
+	case !result.BayFree:
+		reason = "no_bay"
+	default:
+		reason = "no_qualified_technician"
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"available":       false,
+		"reason":          reason,
+		"window":          win,
+		"dealership_id":   dealershipID,
+		"service_type_id": serviceTypeID,
+	})
 }

@@ -32,3 +32,10 @@ func appointmentView(a domain.Appointment) map[string]any {
 		"status":          a.Status,
 	}
 }
+
+func windowView(w domain.TimeRange) map[string]string {
+	return map[string]string{
+		"start": w.Start.Format(time.RFC3339),
+		"end":   w.End.Format(time.RFC3339),
+	}
+}
