@@ -1,0 +1,1 @@
+# AI collaboration notes

@@ -1,0 +1,8 @@
+@"
+/scheduler
+*.exe
+*.env
+.DS_Store
+.vscode/
+.idea/
+"@ | Out-File -Encoding utf8 .gitignore
