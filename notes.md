@@ -278,6 +278,133 @@ opinion about which error it raises first under contention, and a
 correctness mechanism is only as good as the error-handling surface
 around it.
  
-## Task 3 — OpenAPI specification
  
-_(pending — fill in after task is complete)_
+## Task 3 — OpenAPI 3.0 specification
+
+**Branch:** `docs/openapi-spec`
+**Goal:** A complete, valid `openapi.yaml` at the repo root, documenting every
+endpoint registered in `handler.Routes()`. This is the formal API contract that
+the (mocked) client layer integrates against, and the most visible artifact
+besides the README for anyone evaluating the service without reading Go code.
+
+### Direction strategy
+
+The biggest risk with AI-generated OpenAPI specs is that they **drift from the
+actual code** — wire-format field names, response shapes, and error codes can
+all be invented if the AI infers from convention rather than reading the source.
+A spec that contradicts the implementation is worse than no spec.
+
+The prompt required the AI to read `handler.go`, `response.go`, `booking.go`,
+and `domain.go` first, and to extract field names from the actual `json:"..."`
+tags and `map[string]any` literals rather than reverse-engineering from
+English descriptions. Hard rules enumerated:
+
+- snake_case field names from the wire format
+- Timestamps `type: string, format: date-time`; UUIDs `type: string, format: uuid`
+- A single shared `Error` schema referenced by every 4xx/5xx response
+- `reason` as an explicit enum, not a free string
+- Polymorphic `available: true | false` response handled with reasoning
+- Examples must use the seed UUIDs from `migrations/0002_seed.sql` so the spec
+  is immediately curl-testable
+- Top-level `info` block must name both distinguishing properties of the API:
+  no-double-booking and half-open intervals
+
+### What the AI delivered
+
+The first pass was clean and required no corrections. A few items worth
+highlighting because they reflect judgment, not just mechanical translation:
+
+- **Polymorphic response choice.** The availability response has different
+  shapes when `available` is `true` vs `false` (the latter includes `reason`).
+  The AI picked the single-schema approach with nullable `reason` over `oneOf`
+  and explained why in the schema description:
+
+  > *"OpenAPI/JSON Schema discriminators key off a string property, but the
+  > discriminating field here (`available`) is a boolean, so a boolean-keyed
+  > `oneOf` would be invalid/awkward."*
+
+  This is technically correct — OpenAPI 3's `discriminator` keyword requires
+  a string property. The AI did not just pick a valid approach; it picked
+  the right approach and documented the reasoning where a future reader sees it.
+
+- **Tag organization, `operationId`, example summaries.** None of these were
+  required by the prompt. The AI added them anyway because they make the spec
+  more useful when rendered (Swagger UI groups by tag, code generators consume
+  `operationId`, example summaries appear as a dropdown).
+
+- **`info.description` matches the prompt requirement** — explicitly names
+  the half-open interval convention and the exclusion-constraint-based
+  no-double-booking guarantee, so a reader of the spec alone understands what
+  makes this API non-trivial.
+
+### Verification I ran
+
+```
+# Imported into https://editor.swagger.io/ — parsed cleanly, no errors panel.
+# All endpoints render under their tag groups with response schemas, examples,
+# and 4xx/5xx codes correctly resolved via $ref to the shared Error schema.
+# (Swagger Editor's "Try it out" was blocked by browser CORS for HTTP localhost,
+# unrelated to spec validity; verified separately via curl below.)
+
+# End-to-end check: POST /appointments using the spec's request example
+# against the running server.
+$ curl -s -X POST localhost:8080/api/v1/appointments \
+    -H 'Content-Type: application/json' \
+    -d '{"customer_id":"22222222-2222-2222-2222-222222222222",
+         "vehicle_id":"33333333-3333-3333-3333-333333333333",
+         "dealership_id":"11111111-1111-1111-1111-111111111111",
+         "service_type_id":"88888888-8888-8888-8888-888888888888",
+         "desired_start":"2026-12-25T08:00:00Z"}' \
+    -w "\n%{http_code}\n"
+
+{"id":"e9f99525-65e0-4e90-8a45-ab395bc488d8",
+ "dealership_id":"11111111-1111-1111-1111-111111111111",
+ "customer_id":"22222222-2222-2222-2222-222222222222",
+ "vehicle_id":"33333333-3333-3333-3333-333333333333",
+ "service_type_id":"88888888-8888-8888-8888-888888888888",
+ "technician_id":"66666666-6666-6666-6666-666666666666",
+ "service_bay_id":"44444444-4444-4444-4444-444444444444",
+ "start_time":"2026-12-25T08:00:00Z",
+ "end_time":"2026-12-25T09:00:00Z",
+ "status":"confirmed"}
+201
+```
+
+Field-by-field, every key in the response body matches the `Appointment`
+schema in the spec — including the half-open derivation of `end_time` from
+`start_time + service_type.duration` (08:00 → 09:00 for the 60-minute Brake
+Service). The contract is faithful, not just internally consistent.
+
+End-to-end-against-the-real-server is the verification step I trust most
+for an API contract. A spec that is internally valid but drifts from the
+implementation is the trap with AI-generated documentation; running a spec
+example against the running service is the cheapest way to expose that drift.
+If the example fails, the spec lied.
+
+### Reflection — three tasks, three different AI failure modes (or lack thereof)
+
+Across the three tasks, the AI produced different kinds of output — or made
+different kinds of mistakes — in ways that map onto the structure of each task:
+
+- **Task 1 (availability endpoint):** AI made *consistency* mistakes — a
+  locally-declared response struct that broke the `appointmentView` convention,
+  and missing structured logging that broke parity with `Book`. Tests passed;
+  reviewer-level concerns surfaced only on code review.
+- **Task 2 (unit tests for `Overlaps`):** AI made no mistakes. The spec was
+  tight, the surface area small, and the cases enumerated by name. Prompt
+  precision mapped directly to output correctness.
+- **Task 3 (OpenAPI spec):** AI made no functional mistakes and showed
+  judgment beyond what the prompt required. The risk was misalignment with
+  source code, mitigated by the prompt forcing source reading first and by
+  the end-to-end curl verification at the end.
+
+And — separately — the post-Task-2 sanity check surfaced a real bug *in the
+existing code base* (the missing `40P01` retry handler). That had nothing
+to do with AI authorship; it was found by treating sanity-check runs as
+primary signal, not as formality.
+
+Taken together: AI assistance worked best when the task's deterministic
+checks (tests, valid YAML, working curl example) were defined up front and
+treated as the agent's stopping condition. The most useful prompts were not
+the longest — they were the ones that left no room for the AI to invent
+shape where shape was already determined by code.
