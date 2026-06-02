@@ -1,0 +1,450 @@
+openapi: 3.0.3
+info:
+  title: Unified Service Scheduler API
+  version: 1.0.0
+  description: |
+    Backend that books vehicle service appointments. A booking request names a
+    customer, vehicle, dealership, service type, and desired start time. Before
+    confirming, the service verifies that BOTH a service bay AND a qualified
+    technician are free for the whole service duration, then persists a confirmed
+    appointment.
+
+    Two distinguishing properties of this API:
+
+    - **No double-booking guarantee.** Concurrency safety is enforced at the
+      database layer via PostgreSQL `btree_gist` exclusion constraints on a
+      `tstzrange` column (one per service bay, one per technician), scoped to
+      `status = 'confirmed'`. Under concurrent requests for the same resources
+      and window, exactly one booking succeeds; the rest receive `409`.
+    - **Half-open interval convention `[start, end)`.** A window includes its
+      start instant but excludes its end instant — identical to PostgreSQL
+      `tstzrange` with `[)` bounds. Back-to-back appointments (one ending exactly
+      when the next begins) do NOT conflict.
+
+    All timestamps are RFC 3339 / ISO 8601 in UTC.
+
+servers:
+  - url: http://localhost:8080
+    description: Local development
+
+tags:
+  - name: appointments
+    description: Create and retrieve confirmed appointments.
+  - name: availability
+    description: Check whether a bay and qualified technician are free.
+  - name: health
+    description: Liveness and readiness probes.
+
+paths:
+  /healthz:
+    get:
+      tags: [health]
+      summary: Liveness probe
+      description: Returns 200 if the process is alive. Empty body.
+      operationId: getHealthz
+      responses:
+        "200":
+          description: Service is alive.
+
+  /readyz:
+    get:
+      tags: [health]
+      summary: Readiness probe
+      description: Returns 200 if the service is ready to serve traffic. Empty body.
+      operationId: getReadyz
+      responses:
+        "200":
+          description: Service is ready.
+
+  /api/v1/appointments:
+    post:
+      tags: [appointments]
+      summary: Create an appointment
+      description: |
+        Resolves the service type (duration + required skill), computes the
+        half-open window `[desired_start, desired_start + duration)`, selects a
+        free bay and a free qualified technician, and inserts a confirmed
+        appointment in a transaction. The database exclusion constraints are the
+        source of truth for conflict detection; lost races are retried against
+        remaining candidates and yield `409` only when none remain.
+      operationId: createAppointment
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateAppointmentRequest"
+            examples:
+              brakeService:
+                summary: Book a Brake Service at 09:00
+                value:
+                  customer_id: "22222222-2222-2222-2222-222222222222"
+                  vehicle_id: "33333333-3333-3333-3333-333333333333"
+                  dealership_id: "11111111-1111-1111-1111-111111111111"
+                  service_type_id: "88888888-8888-8888-8888-888888888888"
+                  desired_start: "2026-06-01T09:00:00Z"
+      responses:
+        "201":
+          description: Appointment confirmed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Appointment"
+              examples:
+                confirmed:
+                  summary: Confirmed Brake Service
+                  value:
+                    id: "0a8b1c2d-3e4f-5a6b-7c8d-9e0f1a2b3c4d"
+                    dealership_id: "11111111-1111-1111-1111-111111111111"
+                    customer_id: "22222222-2222-2222-2222-222222222222"
+                    vehicle_id: "33333333-3333-3333-3333-333333333333"
+                    service_type_id: "88888888-8888-8888-8888-888888888888"
+                    technician_id: "66666666-6666-6666-6666-666666666666"
+                    service_bay_id: "44444444-4444-4444-4444-444444444444"
+                    start_time: "2026-06-01T09:00:00Z"
+                    end_time: "2026-06-01T10:00:00Z"
+                    status: "confirmed"
+        "400":
+          description: |
+            Invalid request: malformed JSON body, an unparseable UUID or
+            timestamp, or an unknown service type.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                invalidIdOrTimestamp:
+                  summary: Invalid id or timestamp
+                  value:
+                    error: "invalid id or timestamp"
+                unknownServiceType:
+                  summary: Unknown service type
+                  value:
+                    error: "unknown service type"
+        "409":
+          description: |
+            No bay and/or qualified technician is free for the requested window.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                noAvailability:
+                  summary: No resources free
+                  value:
+                    error: "no bay and/or qualified technician available"
+        "500":
+          description: Internal error.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                internal:
+                  value:
+                    error: "internal error"
+
+  /api/v1/appointments/{id}:
+    get:
+      tags: [appointments]
+      summary: Fetch an appointment by id
+      operationId: getAppointment
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Appointment UUID.
+          schema:
+            type: string
+            format: uuid
+          example: "0a8b1c2d-3e4f-5a6b-7c8d-9e0f1a2b3c4d"
+      responses:
+        "200":
+          description: The appointment.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Appointment"
+              examples:
+                found:
+                  value:
+                    id: "0a8b1c2d-3e4f-5a6b-7c8d-9e0f1a2b3c4d"
+                    dealership_id: "11111111-1111-1111-1111-111111111111"
+                    customer_id: "22222222-2222-2222-2222-222222222222"
+                    vehicle_id: "33333333-3333-3333-3333-333333333333"
+                    service_type_id: "88888888-8888-8888-8888-888888888888"
+                    technician_id: "66666666-6666-6666-6666-666666666666"
+                    service_bay_id: "44444444-4444-4444-4444-444444444444"
+                    start_time: "2026-06-01T09:00:00Z"
+                    end_time: "2026-06-01T10:00:00Z"
+                    status: "confirmed"
+        "400":
+          description: The path id is not a valid UUID.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                invalidId:
+                  value:
+                    error: "invalid id"
+        "404":
+          description: No appointment with that id exists.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                notFound:
+                  value:
+                    error: "appointment not found"
+        "500":
+          description: Internal error.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                internal:
+                  value:
+                    error: "internal error"
+
+  /api/v1/dealerships/{dealership_id}/availability:
+    get:
+      tags: [availability]
+      summary: Check availability for a service at a dealership
+      description: |
+        Computes the half-open window `[start, start + duration)` for the given
+        service type and reports whether a free bay and a free qualified
+        technician both exist. This is an optimization/read check only — it is
+        never the sole guard against races; the booking endpoint's exclusion
+        constraints remain authoritative.
+      operationId: getAvailability
+      parameters:
+        - name: dealership_id
+          in: path
+          required: true
+          description: Dealership UUID.
+          schema:
+            type: string
+            format: uuid
+          example: "11111111-1111-1111-1111-111111111111"
+        - name: service_type_id
+          in: query
+          required: true
+          description: Service type UUID.
+          schema:
+            type: string
+            format: uuid
+          example: "88888888-8888-8888-8888-888888888888"
+        - name: start
+          in: query
+          required: true
+          description: Desired start instant (RFC 3339).
+          schema:
+            type: string
+            format: date-time
+          example: "2026-06-01T11:00:00Z"
+      responses:
+        "200":
+          description: |
+            Availability result. Always returns 200 whether or not resources are
+            free; the `available` flag carries the answer. When `available` is
+            false, a `reason` field is present.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AvailabilityResult"
+              examples:
+                available:
+                  summary: Bay and technician free at 11:00
+                  value:
+                    available: true
+                    window:
+                      start: "2026-06-01T11:00:00Z"
+                      end: "2026-06-01T12:00:00Z"
+                    dealership_id: "11111111-1111-1111-1111-111111111111"
+                    service_type_id: "88888888-8888-8888-8888-888888888888"
+                unavailableNoTech:
+                  summary: 09:30 overlaps a 09:00 booking; no brake tech left
+                  value:
+                    available: false
+                    reason: "no_qualified_technician"
+                    window:
+                      start: "2026-06-01T09:30:00Z"
+                      end: "2026-06-01T10:30:00Z"
+                    dealership_id: "11111111-1111-1111-1111-111111111111"
+                    service_type_id: "88888888-8888-8888-8888-888888888888"
+        "400":
+          description: |
+            Invalid or missing parameters (bad dealership_id, missing or invalid
+            service_type_id, missing or invalid start), or an unknown service type.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                missingServiceType:
+                  value:
+                    error: "missing service_type_id"
+                missingStart:
+                  value:
+                    error: "missing start"
+                invalidStart:
+                  value:
+                    error: "invalid start timestamp"
+                unknownServiceType:
+                  value:
+                    error: "unknown service type"
+        "500":
+          description: Internal error.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                internal:
+                  value:
+                    error: "internal error"
+
+components:
+  schemas:
+    CreateAppointmentRequest:
+      type: object
+      required:
+        - customer_id
+        - vehicle_id
+        - dealership_id
+        - service_type_id
+        - desired_start
+      properties:
+        customer_id:
+          type: string
+          format: uuid
+          example: "22222222-2222-2222-2222-222222222222"
+        vehicle_id:
+          type: string
+          format: uuid
+          example: "33333333-3333-3333-3333-333333333333"
+        dealership_id:
+          type: string
+          format: uuid
+          example: "11111111-1111-1111-1111-111111111111"
+        service_type_id:
+          type: string
+          format: uuid
+          example: "88888888-8888-8888-8888-888888888888"
+        desired_start:
+          type: string
+          format: date-time
+          description: Desired start instant (RFC 3339). The end is derived from the service type's duration.
+          example: "2026-06-01T09:00:00Z"
+
+    Appointment:
+      type: object
+      description: A confirmed appointment. Times are the resolved half-open window endpoints.
+      required:
+        - id
+        - dealership_id
+        - customer_id
+        - vehicle_id
+        - service_type_id
+        - technician_id
+        - service_bay_id
+        - start_time
+        - end_time
+        - status
+      properties:
+        id:
+          type: string
+          format: uuid
+        dealership_id:
+          type: string
+          format: uuid
+        customer_id:
+          type: string
+          format: uuid
+        vehicle_id:
+          type: string
+          format: uuid
+        service_type_id:
+          type: string
+          format: uuid
+        technician_id:
+          type: string
+          format: uuid
+        service_bay_id:
+          type: string
+          format: uuid
+        start_time:
+          type: string
+          format: date-time
+          description: Inclusive start of the window.
+        end_time:
+          type: string
+          format: date-time
+          description: Exclusive end of the window (half-open `[start_time, end_time)`).
+        status:
+          type: string
+          example: "confirmed"
+
+    Window:
+      type: object
+      description: Half-open window `[start, end)`.
+      required:
+        - start
+        - end
+      properties:
+        start:
+          type: string
+          format: date-time
+          description: Inclusive start.
+        end:
+          type: string
+          format: date-time
+          description: Exclusive end.
+
+    AvailabilityResult:
+      type: object
+      description: |
+        Result of an availability check. A single schema is used rather than a
+        `oneOf` discriminator: OpenAPI/JSON Schema discriminators key off a
+        string property, but the discriminating field here (`available`) is a
+        boolean, so a boolean-keyed `oneOf` would be invalid/awkward. Instead,
+        `reason` is an optional field present ONLY when `available` is false.
+        When `available` is true, `reason` is absent.
+      required:
+        - available
+        - window
+        - dealership_id
+        - service_type_id
+      properties:
+        available:
+          type: boolean
+          description: True when both a bay and a qualified technician are free for the window.
+        reason:
+          type: string
+          description: Present only when `available` is false. Explains which resource is unavailable.
+          enum:
+            - no_bay
+            - no_qualified_technician
+            - no_bay_and_no_technician
+        window:
+          $ref: "#/components/schemas/Window"
+        dealership_id:
+          type: string
+          format: uuid
+        service_type_id:
+          type: string
+          format: uuid
+
+    Error:
+      type: object
+      description: Uniform error envelope returned for all 4xx and 5xx responses.
+      required:
+        - error
+      properties:
+        error:
+          type: string
+          description: Human-readable error message.
+          example: "no bay and/or qualified technician available"
