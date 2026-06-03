@@ -1,0 +1,19 @@
+# Runs go test against the Postgres service in docker-compose.
+# DATABASE_URL points to the compose service hostname `postgres`, not localhost.
+
+FROM golang:1.26-alpine
+
+WORKDIR /src
+
+# Deps first for caching
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+# Hostname `postgres` is the compose service name (see docker-compose.yml)
+ENV DATABASE_URL=postgres://scheduler:scheduler@postgres:5432/scheduler?sslmode=disable
+
+# Run both unit tests and the integration suite. -count=1 disables test caching
+# so the suite always actually runs.
+CMD ["sh", "-c", "go test ./internal/... -count=1 && go test ./test/... -tags=integration -count=1 -v"]
